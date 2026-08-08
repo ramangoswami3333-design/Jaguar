@@ -1,0 +1,119 @@
+// Jaguar backend — Stripe subscription checkout + webhook handling
+// -----------------------------------------------------------------
+// This server NEVER touches raw card numbers. Stripe Checkout hosts
+// the payment form; this server only creates sessions and reacts to
+// Stripe's webhook events to grant/revoke access.
+
+require('dotenv').config();
+const express = require('express');
+const Stripe = require('stripe');
+const cors = require('cors');
+
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const app = express();
+
+// In-memory "database" placeholder — swap for Postgres/Supabase/Mongo
+// before going live. Keyed by Stripe customer ID.
+const subscribers = new Map();
+
+app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+
+// --- 1. Create a Checkout Session (subscription mode) ---------------
+// Called when a user clicks "Subscribe securely" on the homepage.
+app.post('/create-checkout-session', express.json(), async (req, res) => {
+  try {
+    const { email } = req.body; // optional — pre-fill if you have it
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      customer_email: email || undefined,
+      line_items: [
+        {
+          price: process.env.STRIPE_PRICE_ID, // the $9/month Price ID from Stripe Dashboard
+          quantity: 1,
+        },
+      ],
+      success_url: `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}/pricing`,
+      // Lets Stripe handle proration, retries, dunning emails, etc.
+      subscription_data: {
+        metadata: { product: 'jaguar-membership' },
+      },
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Checkout session error:', err.message);
+    res.status(500).json({ error: 'Could not start checkout' });
+  }
+});
+
+// --- 2. Webhook — Stripe tells us what happened ----------------------
+// IMPORTANT: this route needs the RAW body, so express.raw() runs
+// instead of express.json() for this path only.
+app.post(
+  '/webhook',
+  express.raw({ type: 'application/json' }),
+  (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error('Webhook signature verification failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        subscribers.set(session.customer, {
+          status: 'active',
+          email: session.customer_details?.email,
+          subscriptionId: session.subscription,
+        });
+        console.log(`✅ New subscriber: ${session.customer_details?.email}`);
+        break;
+      }
+
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object;
+        const sub = subscribers.get(invoice.customer);
+        if (sub) sub.status = 'past_due';
+        console.log(`⚠️ Payment failed for customer ${invoice.customer}`);
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object;
+        const sub = subscribers.get(subscription.customer);
+        if (sub) sub.status = 'canceled';
+        console.log(`❌ Subscription canceled: ${subscription.customer}`);
+        break;
+      }
+
+      default:
+        // Unhandled event type — safe to ignore
+        break;
+    }
+
+    res.json({ received: true });
+  }
+);
+
+// --- 3. Simple access check ------------------------------------------
+// Frontend calls this (with the customer's session/email) to decide
+// whether to show full member content or a paywall.
+app.get('/subscription-status/:customerId', express.json(), (req, res) => {
+  const sub = subscribers.get(req.params.customerId);
+  res.json({ active: sub?.status === 'active' });
+});
+
+const PORT = process.env.PORT || 4242;
+app.listen(PORT, () => console.log(`Jaguar backend running on port ${PORT}`));
