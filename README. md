@@ -1,0 +1,6 @@
+/
+├── index.html          → the homepage (deploy as a static site)
+└── backend/
+    ├── server.js        → Express + Stripe subscription backend
+    ├── package.json
+    └── .env.example     → copy to .env and fill in real values (never commit .env)
